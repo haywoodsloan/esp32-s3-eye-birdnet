@@ -1,0 +1,14 @@
+# Managed component dependencies (fetched by the IDF Component Manager).
+# Run `idf.py reconfigure` (or build) to download these into managed_components/.
+dependencies:
+  idf: ">=5.4"
+
+  # Board Support Package for the ESP32-S3-EYE: ST7789 LCD (LVGL), I2S MEMS
+  # microphone via esp_codec_dev, buttons, LED, SD card.
+  espressif/esp32_s3_eye: "^6.0.0"
+
+  # TensorFlow Lite for Microcontrollers + ESP-NN accelerated kernels.
+  espressif/esp-tflite-micro: "^1.3.7"
+
+  # Optimized FFT / DSP primitives used by the log-mel feature frontend.
+  espressif/esp-dsp: "^1.8.2"

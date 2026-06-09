@@ -1,0 +1,18 @@
+# BirdNET model manifest (plain text).
+#
+# Copy to /sdcard/models/manifest.txt on a FAT32 microSD card, alongside the
+# referenced .tflite and .txt files. All models must use the same hybrid
+# contract (24 kHz, FFT 512, 257x256) - see training.md.
+#
+# One model per line:   Name | model.tflite | labels.txt | default
+#   - fields are separated by '|' and trimmed of surrounding spaces
+#   - the labels field may be empty to keep the previously loaded labels
+#   - the 4th field is optional; "default" marks the boot model
+#     (otherwise the first listed model is used at boot)
+#   - blank lines and lines starting with '#' are ignored
+#
+# Press any board button to cycle to the next model.
+
+Spring  | backyard_spring.tflite | backyard_spring.txt | default
+Winter  | backyard_winter.tflite | backyard_winter.txt
+Wetland | wetland.tflite         | wetland.txt

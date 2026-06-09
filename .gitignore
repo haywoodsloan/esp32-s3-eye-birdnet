@@ -1,0 +1,20 @@
+# ---- ESP-IDF build artifacts ----
+build/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# ---- IDF component manager ----
+managed_components/
+dependencies.lock
+
+# ---- Editor / OS ----
+.vscode/settings.json
+*.swp
+.DS_Store
+
+# ---- Trained models (large; keep out of git unless you want them tracked) ----
+# Comment these out if you intend to commit your model.
+main/model/birdnet_model.tflite

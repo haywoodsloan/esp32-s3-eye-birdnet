@@ -1,0 +1,45 @@
+# =============================================================================
+# Default sdkconfig for the ESP32-S3-EYE BirdNET firmware.
+# These values are applied on first configure; tweak via `idf.py menuconfig`.
+# =============================================================================
+
+# ---- Target -----------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash (ESP32-S3-EYE ships with 8 MB) -----------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ---- Octal PSRAM (8 MB) -----------------------------------------------------
+# The audio buffers, mel filterbank, spectrogram, LVGL canvas and the
+# TFLite-Micro tensor arena are all allocated from PSRAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ---- CPU --------------------------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+
+# ---- Compiler ---------------------------------------------------------------
+# -O2 keeps the DSP / inference hot paths fast.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---- Partition table --------------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- FATFS (microSD model storage) ------------------------------------------
+# Long filenames are REQUIRED: the ".tflite" extension alone is 6 chars, which
+# exceeds the FAT 8.3 limit, so SD model files won't open without LFN.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# ---- Main task --------------------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ---- Task watchdog: give long inference invokes some slack ------------------
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10

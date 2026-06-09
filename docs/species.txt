@@ -1,0 +1,21 @@
+# Example species list for training a BirdNET-Tiny model.
+#
+# One scientific name per line. These MUST match (in the same order) the
+# labels in main/model/labels.c once you train and embed a real model.
+#
+# Used with BirdNET-Tiny-Forge:
+#   xc-download --api-key <KEY> --species-file docs/species.txt --n-recs 200
+#
+# Replace these with the species that actually occur where your board listens.
+Turdus migratorius
+Cardinalis cardinalis
+Cyanocitta cristata
+Poecile atricapillus
+Passer domesticus
+Spinus tristis
+Zenaida macroura
+Agelaius phoeniceus
+Melospiza melodia
+Baeolophus bicolor
+Dryobates pubescens
+Sturnus vulgaris
