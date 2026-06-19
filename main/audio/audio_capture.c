@@ -24,6 +24,14 @@ static const char *TAG = "audio_capture";
 
 static esp_codec_dev_handle_t s_mic = NULL;
 
+/* Software input gain (linear). 1.0 = unity. The S3-EYE's I2S MEMS mic has no
+ * hardware/codec gain stage, so esp_codec_dev_set_in_gain() returns
+ * NOT_SUPPORTED and the configured BIRDNET_MIC_GAIN_DB would otherwise do
+ * nothing -- leaving the raw MEMS level too quiet for moderate sources. When
+ * hardware gain is unavailable we set this from BIRDNET_MIC_GAIN_DB and apply
+ * it digitally in the decimation loop (with the existing saturation clamp). */
+static float s_gain_lin = 1.0f;
+
 /*
  * The S3-EYE I2S MEMS mic returns data that, decimated naively, leaves a
  * spectral image mirrored around fs/4: any real or repeated content above the
@@ -85,10 +93,15 @@ esp_err_t audio_capture_init(void)
         return ESP_FAIL;
     }
 
-    /* Apply input gain (digital). Non-fatal if unsupported. */
+    /* Apply input gain. Prefer the codec's hardware gain; if the device has no
+     * gain stage (the S3-EYE MEMS mic returns NOT_SUPPORTED), fall back to
+     * applying the same gain digitally in the read path so BIRDNET_MIC_GAIN_DB
+     * still takes effect. */
     int rc = esp_codec_dev_set_in_gain(s_mic, BIRDNET_MIC_GAIN_DB);
     if (rc != ESP_CODEC_DEV_OK) {
-        ESP_LOGW(TAG, "set_in_gain rc=%d (continuing)", rc);
+        s_gain_lin = powf(10.0f, BIRDNET_MIC_GAIN_DB / 20.0f);
+        ESP_LOGW(TAG, "HW mic gain unsupported (rc=%d); applying %.0f dB (%.1fx) in software",
+                 rc, (double)BIRDNET_MIC_GAIN_DB, (double)s_gain_lin);
     }
 
     esp_codec_dev_sample_info_t fs = {
@@ -156,6 +169,7 @@ esp_err_t audio_capture_read(int16_t *dst, size_t num_samples)
             for (int k = 0; k < DECIM_TAPS; ++k) {
                 acc += s_decim_h[k] * (float)s_work[base + k];
             }
+            acc *= s_gain_lin;            /* software input gain (1.0 if HW gain worked) */
             int v = (int)lrintf(acc);
             if (v >  32767) v =  32767;
             if (v < -32768) v = -32768;

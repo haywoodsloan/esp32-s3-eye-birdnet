@@ -17,6 +17,7 @@
 #include "stft_frontend.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -36,6 +37,11 @@ static float  s_window[BIRDNET_FFT_SIZE];            /* Hann window            *
 static float  s_fft[2 * BIRDNET_FFT_SIZE];           /* interleaved complex    */
 static float *s_padded = NULL;                       /* PADDED_LEN floats      */
 
+/* Pre-STFT high-pass biquad (RBJ cookbook, Butterworth Q). Coefficients are
+ * built once from BIRDNET_HPF_HZ; s_hp_on is false when the cutoff is 0. */
+static float s_hp_b0, s_hp_b1, s_hp_b2, s_hp_a1, s_hp_a2;
+static bool  s_hp_on = false;
+
 static void *psram_or_internal(size_t bytes)
 {
     void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -43,6 +49,34 @@ static void *psram_or_internal(size_t bytes)
         p = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
     }
     return p;
+}
+
+/* Design a 2nd-order Butterworth high-pass at BIRDNET_HPF_HZ (RBJ high-pass). */
+static void design_highpass(void)
+{
+    if (BIRDNET_HPF_HZ <= 0) {
+        s_hp_on = false;
+        return;
+    }
+    const float f0 = (float)BIRDNET_HPF_HZ;
+    const float fs = (float)BIRDNET_SAMPLE_RATE_HZ;
+    const float w0 = 2.0f * (float)M_PI * f0 / fs;
+    const float cw = cosf(w0);
+    const float sw = sinf(w0);
+    const float q  = 0.70710678f;          /* Butterworth */
+    const float alpha = sw / (2.0f * q);
+    const float b0 = (1.0f + cw) * 0.5f;
+    const float b1 = -(1.0f + cw);
+    const float b2 = (1.0f + cw) * 0.5f;
+    const float a0 = 1.0f + alpha;
+    const float a1 = -2.0f * cw;
+    const float a2 = 1.0f - alpha;
+    s_hp_b0 = b0 / a0;
+    s_hp_b1 = b1 / a0;
+    s_hp_b2 = b2 / a0;
+    s_hp_a1 = a1 / a0;
+    s_hp_a2 = a2 / a0;
+    s_hp_on = true;
 }
 
 esp_err_t stft_frontend_init(void)
@@ -60,6 +94,7 @@ esp_err_t stft_frontend_init(void)
     }
 
     dsps_wind_hann_f32(s_window, BIRDNET_FFT_SIZE);
+    design_highpass();
 
     ESP_LOGI(TAG, "ready: SR=%d FFT=%d bins=%d frames=%d hop=%d (%.1fs chunk)",
              BIRDNET_SAMPLE_RATE_HZ, BIRDNET_FFT_SIZE, BIRDNET_FFT_BINS,
@@ -73,8 +108,35 @@ static void build_padded(const int16_t *chunk)
     const int pad = BIRDNET_STFT_PAD;
     const int n   = BIRDNET_CHUNK_SAMPLES;
 
+    /* Remove the per-chunk DC offset, then high-pass, before the STFT. The I2S
+     * MEMS mic carries a DC bias plus strong sub-audible rumble / low-frequency
+     * self-noise that the model's training data -- clean field recordings --
+     * does not. Because the spectrogram is then GLOBALLY min-max normalized,
+     * that low-frequency energy dominates the frame and saturates the low rows,
+     * which the model reads as a low-pitched call and maps onto low-frequency
+     * species (hawks/owls/woodpeckers -> "Cooper's Hawk"). Subtracting the mean
+     * kills DC (FFT bin 0); the Butterworth high-pass (BIRDNET_HPF_HZ) removes
+     * the rest of the rumble below the lowest bird fundamentals. This is
+     * gain-invariant, which is why input-gain changes never affected it. */
+    double sum = 0.0;
     for (int i = 0; i < n; ++i) {
-        s_padded[pad + i] = (float)chunk[i] / 32768.0f;
+        sum += (double)chunk[i];
+    }
+    const float dc = (float)(sum / (double)n);
+
+    /* Direct Form II Transposed biquad; state resets per chunk (each 3 s chunk
+     * is an independent analysis window, so the startup transient -- a few ms
+     * on a zero-mean signal -- is negligible over 72000 samples). */
+    float z1 = 0.0f, z2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float x = ((float)chunk[i] - dc) / 32768.0f;
+        if (s_hp_on) {
+            float y = s_hp_b0 * x + z1;
+            z1 = s_hp_b1 * x - s_hp_a1 * y + z2;
+            z2 = s_hp_b2 * x - s_hp_a2 * y;
+            x = y;
+        }
+        s_padded[pad + i] = x;
     }
     /* Left/right reflect (mirror around the edge sample, excluding it). */
     for (int i = 0; i < pad; ++i) {

@@ -43,3 +43,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # ---- Task watchdog: give long inference invokes some slack ------------------
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# ---- LVGL -------------------------------------------------------------------
+# The bundled UI fonts (main/ui/assets/roboto_*.c) are emitted by lv_font_conv
+# with RLE-compressed glyph bitmaps (bitmap_format = LV_FONT_FMT_TXT_COMPRESSED).
+# Without this option the compressed-glyph decoder is not compiled in, so every
+# glyph decodes to nothing and ALL text is invisible while images/shapes still
+# render. Enable it so the detection-overlay name + confidence text show.
+CONFIG_LV_USE_FONT_COMPRESSED=y

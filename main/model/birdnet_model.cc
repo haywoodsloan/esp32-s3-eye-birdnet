@@ -89,7 +89,13 @@ uint8_t *g_arena = nullptr;
 /* Superset covering the in-graph hybrid frontend (Transpose, mel-mixer Conv2D,
  * ReLU, ReduceMax/Div max-norm, Concatenation channel-pad, StridedSlice, PWL
  * Add/Mul) plus the DS-CNN body (DepthwiseConv2D, Add residuals, Mul SE,
- * Relu6, Mean GAP, FullyConnected, Logistic) and float<->int8 boundary. */
+ * Relu6, Mean GAP, FullyConnected, Logistic) and float<->int8 boundary.
+ *
+ * NOTE: the model must be exported with a STATIC batch of 1 (see the training
+ * repo's conversion step). A dynamic batch makes the frontend's channel-pad
+ * emit tf.zeros(tf.shape(x)) -> Shape/Pack/Fill ops; TFLite-Micro's Fill kernel
+ * rejects a non-constant dims tensor, so AllocateTensors() fails on-device. A
+ * static batch constant-folds those away, so they are intentionally NOT here. */
 using BirdNetOpResolver = tflite::MicroMutableOpResolver<28>;
 BirdNetOpResolver g_resolver;
 bool g_resolver_ready = false;
@@ -140,6 +146,21 @@ void teardown_interpreter()
     g_output = nullptr;
     g_loaded = false;
 }
+
+/* Abandon a half-built interpreter WITHOUT running its destructor. After a
+ * failed AllocateTensors() the subgraph table is left partially initialized, so
+ * ~MicroInterpreter()->FreeSubgraphs() dereferences an uninitialized pointer and
+ * crashes (LoadProhibited) -- which turns a recoverable load failure into a boot
+ * loop. The interpreter lives in a fixed storage block and owns nothing outside
+ * the reused PSRAM arena, so simply forgetting it leaks nothing; the next load
+ * placement-news over the same storage. */
+void forget_interpreter()
+{
+    g_interp = nullptr;
+    g_input = nullptr;
+    g_output = nullptr;
+    g_loaded = false;
+}
 }  // namespace
 
 /* ------------------------------------------------------------------------- */
@@ -185,6 +206,11 @@ esp_err_t birdnet_model_set(const uint8_t *model_data, size_t len)
         return ESP_FAIL;
     }
 
+    /* Log the size up front: AllocateTensors() can fail before any other line
+     * prints, so this is the only on-device confirmation of WHICH .tflite was
+     * read from SD (size is the quickest way to tell stale vs current). */
+    ESP_LOGI(TAG, "loading model: %u bytes", (unsigned)len);
+
     /* Drop the old interpreter before building the new one (destruction does
      * not read the model flatbuffer, so buffer reuse upstream is safe). */
     teardown_interpreter();
@@ -194,7 +220,10 @@ esp_err_t birdnet_model_set(const uint8_t *model_data, size_t len)
 
     if (g_interp->AllocateTensors() != kTfLiteOk) {
         ESP_LOGE(TAG, "AllocateTensors failed (arena too small or missing op?)");
-        teardown_interpreter();
+        /* Forget (do NOT destruct) the half-built interpreter: its destructor
+         * crashes after a failed allocation. Returning cleanly lets the caller
+         * fall back to the embedded/mock model instead of panicking. */
+        forget_interpreter();
         return ESP_FAIL;
     }
 

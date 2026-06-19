@@ -1,0 +1,11 @@
+# BirdNET model manifest (test).
+#
+# Copy the whole `sdcard/models/` folder to the root of the FAT32 microSD card
+# so the board sees /sdcard/models/manifest.txt + the referenced files.
+#
+# Line format:  Name | model.tflite | labels.txt | default
+#   - '|'-separated, surrounding spaces trimmed
+#   - 4th field optional; "default" marks the boot model
+#   - '#' comments and blank lines ignored
+
+Plainfield 74 | plainfield74.tflite | plainfield74.txt | default

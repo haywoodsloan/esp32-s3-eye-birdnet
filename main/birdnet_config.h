@@ -29,7 +29,7 @@
  * Audio capture / chunking
  * ------------------------------------------------------------------------- */
 #define BIRDNET_SAMPLE_RATE_HZ      24000   /* mic sample rate (Hz)            */
-#define BIRDNET_MIC_GAIN_DB         42.0f   /* digital input gain (BSP value)  */
+#define BIRDNET_MIC_GAIN_DB         12.0f   /* mic input gain in dB (software; ~4x). Raise if too quiet, lower if the meter pins red / clips. */
 #define BIRDNET_CHUNK_SECONDS       3       /* analysis window (s)             */
 #define BIRDNET_CHUNK_SAMPLES       (BIRDNET_SAMPLE_RATE_HZ * BIRDNET_CHUNK_SECONDS) /* 72000 */
 #define BIRDNET_READ_SAMPLES        1024    /* mic read block size (samples)   */
@@ -45,6 +45,19 @@
 
 /* Model input element count: [1, FFT_BINS, SPEC_WIDTH, 1]. */
 #define BIRDNET_MODEL_INPUT_LEN     (BIRDNET_FFT_BINS * BIRDNET_SPEC_WIDTH)
+
+/*
+ * High-pass cutoff (Hz) applied to the audio before the STFT. The I2S MEMS mic
+ * adds strong sub-audible rumble + low-frequency self-noise (HVAC, handling,
+ * 1/f) that clean training recordings do not have. Because the spectrogram is
+ * globally min-max normalized, that low-frequency energy dominates the frame
+ * and biases the model toward low-pitched species (hawks/owls -> "Cooper's
+ * Hawk"). A 2nd-order Butterworth high-pass removes it. 200 Hz sits below the
+ * lowest target-bird fundamentals (owl hoots ~300 Hz, dove coos ~400 Hz) so it
+ * trims rumble without touching bird calls. Set to 0 to disable.
+ */
+#define BIRDNET_HPF_HZ              200
+
 
 /* ----------------------------------------------------------------------------
  * Inference
@@ -65,8 +78,70 @@
 /* sigmoid (multi-label) head: report the top class above this score. */
 #define BIRDNET_DETECT_THRESHOLD    0.50f
 
+/*
+ * Temporal voting (debounce): a detection is only published once the SAME
+ * species clears BIRDNET_DETECT_THRESHOLD on this many CONSECUTIVE inferences.
+ * Windows overlap every BIRDNET_INFER_INTERVAL_MS, so 2 means the call must
+ * persist ~1.5 s. The model keeps a residual tendency to spike to class 0
+ * ("Cooper's Hawk") on the odd near-silent frame, but those spikes oscillate
+ * (e.g. 0.72 -> 0.36 -> 0.69) and never clear the threshold twice in a row, so
+ * requiring 2 consecutive frames suppresses them while a real, sustained call
+ * still fires. Set to 1 for the old behavior (every single-frame crossing
+ * fires; more sensitive, more false positives); raise to 3 if false positives
+ * persist.
+ */
+#define BIRDNET_DETECT_CONSECUTIVE  2
+
+/* Debug: log input spectrogram range + top-3 scoring classes each inference.
+ * Set to 0 for normal operation. */
+#ifndef BIRDNET_DEBUG_SCORES
+#define BIRDNET_DEBUG_SCORES        1
+#endif
+
+/*
+ * Record mode: instead of running detection, capture the device's own audio to
+ * the SD card as WAV clips (<mount>/rec/devNNN.wav, 24 kHz mono). These are used
+ * as device-domain "background" negatives to fine-tune the model so it stops
+ * defaulting to a bird on this microphone's room tone / self-noise. Currently
+ * OFF (normal detection). To record more negatives: set this to 1, build +
+ * flash, let it record, copy the clips off the card, then set back to 0.
+ * Repeat sessions ACCUMULATE (each flash continues numbering after the existing
+ * clips), so you can record several rooms/times without losing earlier ones.
+ */
+#ifndef BIRDNET_RECORD_MODE
+#define BIRDNET_RECORD_MODE         0
+#endif
+#define BIRDNET_RECORD_SECS         10      /* length of each clip (s)             */
+#define BIRDNET_RECORD_CLIPS        48      /* clips per session (48 x 10 s = 8 min) */
+
 /* Upper bound for the per-class score scratch buffer. */
 #define BIRDNET_NUM_CLASSES_MAX     128
+
+/*
+ * Detection overlay: when a species is detected, a full-screen card (common
+ * name, photo, color-coded confidence) is shown over the spectrogram + meter
+ * for this long. A new detection within the window restarts the timer.
+ */
+#define BIRDNET_DETECT_OVERLAY_MS   5000
+
+/*
+ * Overlay demo mode (verification aid). When set to 1, the firmware does NOT
+ * run the mic + model; instead it cycles the detection overlay through every
+ * species in the active label table, loading each one's photo from the SD card,
+ * so the card + photo path can be checked end-to-end before testing real
+ * detections. The confidence sweeps low->high across the species so the bar's
+ * red->green gradient is exercised too. Leave at 0 for normal operation.
+ */
+#ifndef BIRDNET_DEMO_OVERLAY
+#define BIRDNET_DEMO_OVERLAY        0
+#endif
+
+/*
+ * Time each species card is shown in demo mode (ms). Keep below
+ * BIRDNET_DETECT_OVERLAY_MS so the card stays up continuously (its content
+ * swaps in place) instead of hiding between species.
+ */
+#define BIRDNET_DEMO_OVERLAY_MS     3000
 
 /* ----------------------------------------------------------------------------
  * Display (LCD spectrogram)
@@ -111,6 +186,29 @@
  * capped by the other.
  */
 #define BIRDNET_UI_FRAME_MS         16      /* ~60 fps (was 40 ms / 25 fps)    */
+
+/* ----------------------------------------------------------------------------
+ * Detection overlay assets (bird photos on SD)
+ * ------------------------------------------------------------------------- */
+/*
+ * On a detection the overlay shows a square RGB565 photo of the species, read
+ * from the SD card at:  <mount>/birds/<sanitized scientific name>.bin
+ * The name is sanitized by lowercasing and mapping every non [a-z0-9] byte to
+ * '_' (the tools/birds converter uses the identical rule). Each file is a tiny
+ * 8-byte header ("BN16", uint16 LE width, uint16 LE height) followed by
+ * width*height RGB565 pixels (uint16 LE, same bit order as the UI's rgb565()).
+ *
+ * The converter emits images at BIRDNET_BIRD_IMG_PX; the firmware accepts any
+ * size up to BIRDNET_BIRD_IMG_MAX_PX (its load buffer is sized from the max).
+ *
+ * The detection overlay shows the photo full-bleed (the whole 240x240 card minus
+ * its 4 px border = 232 px), so images are emitted at 232 px to fill that area
+ * pixel-for-pixel with no upscaling. The load buffer allows up to 240 px (the
+ * full screen). At 240 px the PSRAM buffer is 240*240*2 = 112.5 KB.
+ */
+#define BIRDNET_BIRDS_SUBDIR        "/birds"
+#define BIRDNET_BIRD_IMG_PX         232
+#define BIRDNET_BIRD_IMG_MAX_PX     240
 
 /* ----------------------------------------------------------------------------
  * SD-backed multi-model swap (Option B)

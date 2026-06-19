@@ -1,10 +1,13 @@
-# Example species list for training a BirdNET-Tiny model.
+# Example species list (Eastern-US backyard birds) for training a birdnet-stm32
+# "hybrid" model for this firmware.
 #
-# One scientific name per line. These MUST match (in the same order) the
-# labels in main/model/labels.c once you train and embed a real model.
+# One scientific name per line. These MUST match (in the same order) the labels
+# in main/model/labels.c once you train and embed a real model.
 #
-# Used with BirdNET-Tiny-Forge:
-#   xc-download --api-key <KEY> --species-file docs/species.txt --n-recs 200
+# birdnet-stm32 trains on a subset of iNatSounds 2024 (organized as
+# data/train/<Scientific_name>/*.wav). Ready-made regional species lists also
+# ship in the birdnet-stm32 repo under dev/ (e.g. species_list_USE.txt for the
+# Eastern US). See docs/training.md step 2.
 #
 # Replace these with the species that actually occur where your board listens.
 Turdus migratorius
