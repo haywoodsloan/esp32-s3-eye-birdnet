@@ -24,6 +24,11 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
 
+# ---- I2S audio --------------------------------------------------------------
+# Keep the I2S DMA ISR in IRAM so microphone capture is not stalled by flash
+# cache misses (e.g. during SD-card model swaps), avoiding audio glitches.
+CONFIG_I2S_ISR_IRAM_SAFE=y
+
 # ---- Compiler ---------------------------------------------------------------
 # -O2 keeps the DSP / inference hot paths fast.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

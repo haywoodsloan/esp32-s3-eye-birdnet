@@ -118,11 +118,13 @@ static void build_padded(const int16_t *chunk)
      * kills DC (FFT bin 0); the Butterworth high-pass (BIRDNET_HPF_HZ) removes
      * the rest of the rumble below the lowest bird fundamentals. This is
      * gain-invariant, which is why input-gain changes never affected it. */
-    double sum = 0.0;
+    /* Exact integer accumulation: 72000 int16 samples can sum past 2^24, where
+     * a float loses integer precision, and the S3 has no hardware double. */
+    int64_t sum = 0;
     for (int i = 0; i < n; ++i) {
-        sum += (double)chunk[i];
+        sum += chunk[i];
     }
-    const float dc = (float)(sum / (double)n);
+    const float dc = (float)sum / (float)n;
 
     /* Direct Form II Transposed biquad; state resets per chunk (each 3 s chunk
      * is an independent analysis window, so the startup transient -- a few ms

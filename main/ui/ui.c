@@ -118,6 +118,18 @@ static uint16_t colormap(float v)
     return rgb565(r, g, b);
 }
 
+/* Precomputed RGB565 colormap, filled once in ui_init(). draw_spectrogram does
+ * CANVAS_W*CANVAS_H (~48k) lookups per frame, so a 256-entry table replaces the
+ * per-pixel float interpolation above with a single indexed load. */
+static uint16_t s_cmap_lut[256];
+
+static void colormap_init(void)
+{
+    for (int i = 0; i < 256; ++i) {
+        s_cmap_lut[i] = colormap((float)i / 255.0f);
+    }
+}
+
 static void draw_spectrogram(const float *display)
 {
     if (s_canvas_buf == NULL || display == NULL) {
@@ -127,7 +139,10 @@ static void draw_spectrogram(const float *display)
         uint16_t *row = &s_canvas_buf[y * CANVAS_W];
         const float *src = &display[y * BIRDNET_DISP_W];
         for (int x = 0; x < CANVAS_W; ++x) {
-            row[x] = colormap(src[x]);
+            int idx = (int)(src[x] * 255.0f + 0.5f);
+            if (idx < 0) idx = 0;
+            else if (idx > 255) idx = 255;
+            row[x] = s_cmap_lut[idx];
         }
     }
     lv_obj_invalidate(s_canvas);
@@ -407,8 +422,10 @@ static void overlay_show(const char *name, const char *sci, float score)
     lv_timer_resume(s_ov_timer);
 }
 
-int ui_init(void)
+esp_err_t ui_init(void)
 {
+    colormap_init();
+
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -423,7 +440,7 @@ int ui_init(void)
     }
     if (s_canvas_buf == NULL) {
         ESP_LOGE(TAG, "failed to allocate canvas buffer");
-        return -1;
+        return ESP_FAIL;
     }
     for (int i = 0; i < CANVAS_W * CANVAS_H; ++i) {
         s_canvas_buf[i] = 0;
@@ -444,7 +461,7 @@ int ui_init(void)
     }
     if (s_meter_buf == NULL) {
         ESP_LOGE(TAG, "failed to allocate meter buffer");
-        return -1;
+        return ESP_FAIL;
     }
     for (int i = 0; i < METER_W * METER_H; ++i) {
         s_meter_buf[i] = 0x0000;
@@ -526,7 +543,7 @@ int ui_init(void)
 
     ESP_LOGI(TAG, "UI initialized (%dx%d canvas, %d-seg meter)",
              CANVAS_W, CANVAS_H, METER_SEGMENTS);
-    return 0;
+    return ESP_OK;
 }
 
 void ui_update(const ui_snapshot_t *snap)

@@ -106,12 +106,15 @@ static void audio_task(void *arg)
             continue;
         }
 
-        double sum_sq = 0.0;
+        /* ESP32-S3 has a single-precision FPU only; double math is software-
+         * emulated. The samples are normalized to [-1,1], so a float sum is
+         * amply precise for level metering and far cheaper. */
+        float sum_sq = 0.0f;
         for (int i = 0; i < BIRDNET_READ_SAMPLES; ++i) {
             float s = (float)read_buf[i] / 32768.0f;
-            sum_sq += (double)s * (double)s;
+            sum_sq += s * s;
         }
-        s_level = sqrtf((float)(sum_sq / (double)BIRDNET_READ_SAMPLES));
+        s_level = sqrtf(sum_sq / (float)BIRDNET_READ_SAMPLES);
 
         xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
         for (int i = 0; i < BIRDNET_READ_SAMPLES; ++i) {
@@ -169,24 +172,31 @@ static void infer_task(void *arg)
             model_registry_apply(pending);   /* logs the active model on success */
         }
 
-        /* Snapshot the last 3 s in chronological order (oldest at s_ring_w). */
+        /* Snapshot the last 3 s in chronological order (oldest at s_ring_w).
+         * The ring is contiguous in two spans (w..end, then 0..w), so copy each
+         * with memcpy instead of a per-sample modulo across 72000 samples, and
+         * keep the critical section to just the copy. */
         xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
         uint32_t w = s_ring_w;
-        double sum_sq = 0.0;
-        for (uint32_t i = 0; i < BIRDNET_CHUNK_SAMPLES; ++i) {
-            int16_t s = s_ring[(w + i) % BIRDNET_CHUNK_SAMPLES];
-            chunk[i] = s;
-            float f = (float)s / 32768.0f;
-            sum_sq += (double)f * (double)f;
+        uint32_t first = BIRDNET_CHUNK_SAMPLES - w;
+        memcpy(chunk, &s_ring[w], first * sizeof(int16_t));
+        if (w) {
+            memcpy(chunk + first, s_ring, w * sizeof(int16_t));
         }
         xSemaphoreGive(s_ring_mutex);
+
+        float sum_sq = 0.0f;
+        for (uint32_t i = 0; i < BIRDNET_CHUNK_SAMPLES; ++i) {
+            float f = (float)chunk[i] / 32768.0f;
+            sum_sq += f * f;
+        }
 
         /* Level gate: skip inference when the 3 s chunk is below the meter's
          * "usable" floor (BIRDNET_LEVEL_DB_QUIET, the grey->green boundary).
          * The model self-normalizes, so on near-silence it would otherwise
          * classify room noise and emit confident false positives. Keeping this
          * aligned with the meter means "green = the detector is listening". */
-        float chunk_rms = sqrtf((float)(sum_sq / (double)BIRDNET_CHUNK_SAMPLES));
+        float chunk_rms = sqrtf(sum_sq / (float)BIRDNET_CHUNK_SAMPLES);
         float chunk_db = 20.0f * log10f(chunk_rms + 1e-6f);
         if (chunk_db < BIRDNET_LEVEL_DB_QUIET) {
             vote_index = -1;   /* silence breaks the detection streak */
@@ -488,7 +498,7 @@ void app_main(void)
     bsp_display_start_with_config(&disp_cfg);
     bsp_display_backlight_on();
     bsp_display_lock(0);
-    ui_init();
+    ESP_ERROR_CHECK(ui_init());
     bsp_display_unlock();
 
     /* DSP + classifier scaffolding (arena + op resolver; no model yet). */

@@ -169,10 +169,11 @@ void forget_interpreter()
 esp_err_t birdnet_model_init(void)
 {
     if (g_arena == nullptr) {
+        /* 32-byte (cache-line) alignment for the tensor arena. */
         g_arena = (uint8_t *)heap_caps_aligned_alloc(
-            16, kArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            32, kArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (g_arena == nullptr) {
-            g_arena = (uint8_t *)heap_caps_aligned_alloc(16, kArenaSize, MALLOC_CAP_8BIT);
+            g_arena = (uint8_t *)heap_caps_aligned_alloc(32, kArenaSize, MALLOC_CAP_8BIT);
         }
         if (g_arena == nullptr) {
             ESP_LOGE(TAG, "failed to allocate %d byte tensor arena", kArenaSize);

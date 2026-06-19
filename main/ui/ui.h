@@ -8,6 +8,8 @@
 
 #include <stdint.h>
 
+#include "esp_err.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,8 +29,8 @@ typedef struct {
     float        det_score; /**< Detection confidence in [0, 1].                   */
 } ui_snapshot_t;
 
-/** @brief Build the widget tree and the spectrogram canvas. @return 0 on success. */
-int ui_init(void);
+/** @brief Build the widget tree and the spectrogram canvas. @return ESP_OK on success. */
+esp_err_t ui_init(void);
 
 /** @brief Render one frame from @p snap. */
 void ui_update(const ui_snapshot_t *snap);
