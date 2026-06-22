@@ -31,6 +31,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "bsp/esp32_s3_eye.h"
 #include "iot_button.h"
@@ -42,6 +43,12 @@
 #include "model_registry.h"
 #include "labels.h"
 #include "ui.h"
+
+#if BIRDNET_USE_PRIOR
+#include "nvs_flash.h"
+#include "occurrence_prior.h"
+#include "birdnet_time.h"
+#endif
 
 #if BIRDNET_HAS_REAL_MODEL
 #include "model_data.h"
@@ -135,6 +142,136 @@ static void audio_task(void *arg)
 }
 
 /* ---- Inference task ----------------------------------------------------- */
+#if BIRDNET_RECORD_MODE || BIRDNET_LOG_AUDIO
+/* Write a 44-byte canonical PCM WAV header for a known sample count. ESP32-S3 is
+ * little-endian and WAV is little-endian, so the integer fields copy directly. */
+static void wav_write_header(FILE *f, uint32_t num_samples)
+{
+    const uint32_t sr         = BIRDNET_SAMPLE_RATE_HZ;
+    const uint16_t ch         = 1;
+    const uint16_t bits       = 16;
+    const uint16_t block_algn = (uint16_t)(ch * (bits / 8));
+    const uint32_t byte_rate  = sr * block_algn;
+    const uint32_t data_bytes = num_samples * block_algn;
+    const uint32_t riff_size  = 36 + data_bytes;
+    const uint32_t fmt_size   = 16;
+    const uint16_t fmt_pcm    = 1;
+    uint8_t h[44];
+    memcpy(h + 0,  "RIFF", 4);   memcpy(h + 4,  &riff_size, 4);
+    memcpy(h + 8,  "WAVE", 4);
+    memcpy(h + 12, "fmt ", 4);   memcpy(h + 16, &fmt_size, 4);
+    memcpy(h + 20, &fmt_pcm, 2); memcpy(h + 22, &ch, 2);
+    memcpy(h + 24, &sr, 4);      memcpy(h + 28, &byte_rate, 4);
+    memcpy(h + 32, &block_algn, 2); memcpy(h + 34, &bits, 2);
+    memcpy(h + 36, "data", 4);   memcpy(h + 40, &data_bytes, 4);
+    fwrite(h, 1, sizeof(h), f);
+}
+#endif
+
+#if BIRDNET_LOG_AUDIO
+/* Save one inference's 3 s chunk as a 24 kHz mono WAV so it can be played back
+ * and correlated to its CSV row (via that row's "clip" column). */
+static esp_err_t birdlog_wav_clip(const char *path, const int16_t *samples, uint32_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+    wav_write_header(f, n);
+    size_t wrote = fwrite(samples, sizeof(int16_t), n, f);
+    fclose(f);
+    return (wrote == (size_t)n) ? ESP_OK : ESP_FAIL;
+}
+#endif
+
+#if BIRDNET_LOG_TO_FILE
+/* Append one diagnostic CSV row to BIRDNET_LOG_PATH on the SD card. Opened and
+ * closed per row so a power cut (battery use outdoors) loses at most one line.
+ * Columns: ms,level_db,mean,lowband,week,t1,t1s,t2,t2s,t3,t3s,a1,a1s,hit,vote,det,infer_ms,clip
+ * (t* = RAW model top-3 class index:score; week = seasonal-prior week index
+ * [0,47] or -1 if unknown; a1:a1s = the prior-ADJUSTED top-1 that drove the
+ * hit/vote/det columns; -1 indices = inference skipped by the level gate;
+ * infer_ms = model wall-clock time, 0 on gated rows; clip = saved WAV name when
+ * BIRDNET_LOG_AUDIO is on, else empty). */
+static void birdlog_row(float level_db, double mean, double lowband, int week,
+                        int i0, float s0, int i1, float s1, int i2, float s2,
+                        int a1, float a1s, int hit, int vote, int det,
+                        float infer_ms, int clip_id)
+{
+    FILE *lf = fopen(BIRDNET_LOG_PATH, "a");
+    if (lf == NULL) {
+        return;
+    }
+    char clip[20];
+    if (clip_id >= 0) {
+        snprintf(clip, sizeof(clip), "clip%06d", clip_id);
+    } else {
+        clip[0] = '\0';
+    }
+    fprintf(lf, "%u,%.1f,%.4f,%.4f,%d,%d,%.3f,%d,%.3f,%d,%.3f,%d,%.3f,%d,%d,%d,%.1f,%s\n",
+            (unsigned)esp_log_timestamp(), (double)level_db, mean, lowband, week,
+            i0, (double)s0, i1, (double)s1, i2, (double)s2,
+            a1, (double)a1s, hit, vote, det, (double)infer_ms, clip);
+    fclose(lf);
+}
+#endif
+
+#if BIRDNET_USE_PRIOR
+/* Seasonal occurrence prior: multiply each class score by a soft, per-week
+ * weight (1.0 at a species' seasonal peak, falling toward BIRDNET_PRIOR_FLOOR
+ * out of season) and re-pick the top class into *res. scores[] is left RAW so
+ * the diagnostic top-3 still mirrors the model directly. Returns the table week
+ * index used [0,47], or -1 when the prior was not applied -- time unknown, or
+ * the active model is not the 74-class set the table was built for (so the
+ * indices would not line up). See birdnet_config.h for the formula + knobs. */
+static int birdnet_apply_prior(const float *scores, int n, birdnet_result_t *res)
+{
+    static float s_prior_max[BIRDNET_PRIOR_CLASSES];
+    static bool  s_prior_max_ready = false;
+
+    if (n != BIRDNET_PRIOR_CLASSES) {
+        return -1;   /* table is specific to the 74-class Plainfield model */
+    }
+    int week = birdnet_time_prior_week();
+    if (week < 0) {
+        return -1;   /* time not known yet -> leave detection unchanged */
+    }
+
+    if (!s_prior_max_ready) {
+        /* Per-class annual peak, so the weight expresses each species' OWN
+         * seasonality (when it is around) rather than how common it is. */
+        for (int i = 0; i < BIRDNET_PRIOR_CLASSES; ++i) {
+            float m = 0.0f;
+            for (int w = 0; w < BIRDNET_PRIOR_WEEKS; ++w) {
+                float p = BIRDNET_OCCURRENCE_PRIOR[w][i];
+                if (p > m) m = p;
+            }
+            s_prior_max[i] = m;
+        }
+        s_prior_max_ready = true;
+    }
+
+    const float strength = BIRDNET_PRIOR_STRENGTH;
+    const float floor_w  = BIRDNET_PRIOR_FLOOR;
+    int   best_i = -1;
+    float best_s = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        float norm = (s_prior_max[i] > 1e-6f)
+                     ? BIRDNET_OCCURRENCE_PRIOR[week][i] / s_prior_max[i]
+                     : 1.0f;   /* no seasonal info -> stay neutral */
+        float w = (1.0f - strength) + strength * (floor_w + (1.0f - floor_w) * norm);
+        float adj = scores[i] * w;
+        if (adj > best_s) {
+            best_s = adj;
+            best_i = i;
+        }
+    }
+    res->top_index = best_i;
+    res->top_score = best_s;
+    return week;
+}
+#endif /* BIRDNET_USE_PRIOR */
+
 static void infer_task(void *arg)
 {
     (void)arg;
@@ -153,6 +290,38 @@ static void infer_task(void *arg)
      * required streak, which rejects one-off near-silence spikes. */
     int vote_index = -1;
     int vote_count = 0;
+
+#if BIRDNET_LOG_TO_FILE
+    {
+        FILE *lf = fopen(BIRDNET_LOG_PATH, "a");
+        if (lf != NULL) {
+            fprintf(lf, "# session start ms=%u\n", (unsigned)esp_log_timestamp());
+            fprintf(lf, "ms,level_db,mean,lowband,week,t1,t1s,t2,t2s,t3,t3s,a1,a1s,hit,vote,det,infer_ms,clip\n");
+            fclose(lf);
+            ESP_LOGI(TAG, "diagnostic file logging -> %s", BIRDNET_LOG_PATH);
+        } else {
+            ESP_LOGW(TAG, "could not open log file %s (SD mounted?)", BIRDNET_LOG_PATH);
+        }
+    }
+#endif
+#if BIRDNET_LOG_AUDIO
+    /* Per-inference audio clips for offline correlation. Resume numbering after
+     * any existing clips so sessions accumulate instead of overwriting. */
+    mkdir(BIRDNET_LOG_AUDIO_DIR, 0777);   /* ignore EEXIST */
+    uint32_t clip_seq = 0;
+    for (;;) {
+        char probe[64];
+        struct stat st;
+        snprintf(probe, sizeof(probe), "%s/clip%06u.wav",
+                 BIRDNET_LOG_AUDIO_DIR, (unsigned)clip_seq);
+        if (stat(probe, &st) != 0) {
+            break;
+        }
+        ++clip_seq;
+    }
+    ESP_LOGI(TAG, "diagnostic audio clips -> %s/clipNNNNNN.wav (from %06u)",
+             BIRDNET_LOG_AUDIO_DIR, (unsigned)clip_seq);
+#endif
 
     for (;;) {
         xSemaphoreTake(s_infer_sem, portMAX_DELAY);
@@ -201,6 +370,11 @@ static void infer_task(void *arg)
         if (chunk_db < BIRDNET_LEVEL_DB_QUIET) {
             vote_index = -1;   /* silence breaks the detection streak */
             vote_count = 0;
+#if BIRDNET_LOG_TO_FILE
+            /* Log gated (too-quiet) frames too, so the analysis can tell
+             * "no audio reached the model" from "model rejected the audio". */
+            birdlog_row(chunk_db, 0.0, 0.0, -1, -1, 0.0f, -1, 0.0f, -1, 0.0f, -1, 0.0f, 0, 0, 0, 0.0f, -1);
+#endif
             continue;   /* too quiet to analyze */
         }
 
@@ -208,49 +382,67 @@ static void infer_task(void *arg)
         stft_frontend_process(chunk, spectro, NULL);
 
         birdnet_result_t res = { .top_index = -1, .top_score = 0.0f, .is_mock = true };
+#if BIRDNET_DEBUG_SCORES || BIRDNET_LOG_TO_FILE
+        const int64_t t_infer0 = esp_timer_get_time();
+#endif
         if (birdnet_model_run(spectro, scores, &res) != ESP_OK) {
             continue;
         }
+#if BIRDNET_DEBUG_SCORES || BIRDNET_LOG_TO_FILE
+        /* Wall-clock time of the model inference (I/O copy + Invoke), to profile
+         * how fast the model runs on this hardware. */
+        const float infer_ms = (float)(esp_timer_get_time() - t_infer0) / 1000.0f;
+#endif
 
-#if BIRDNET_DEBUG_SCORES
-        /* Diagnostic: log the input spectrogram range + the top-3 scoring
-         * classes every inference. A healthy classifier shows the top class
-         * varying with the audio and a clear margin; a stuck top-1 (always the
-         * same class, e.g. index 0) with near-equal runners-up points at a
-         * preprocessing/contract mismatch rather than the audio. */
-        {
-            float smin = 1e30f, smax = -1e30f; double smean = 0.0;
-            for (int i = 0; i < BIRDNET_MODEL_INPUT_LEN; ++i) {
-                float v = spectro[i];
-                if (v < smin) smin = v;
-                if (v > smax) smax = v;
-                smean += v;
-            }
-            smean /= (double)BIRDNET_MODEL_INPUT_LEN;
-            /* Mean of the lowest 9 freq bins (DC..~420 Hz). If this is much
-             * larger than the overall mean, low-frequency/DC energy dominates
-             * the spectrogram (the "always a low-pitched bird" failure). */
-            double lowband = 0.0;
-            for (int b = 0; b < 9; ++b) {
-                for (int t = 0; t < BIRDNET_SPEC_WIDTH; ++t) {
-                    lowband += spectro[b * BIRDNET_SPEC_WIDTH + t];
-                }
-            }
-            lowband /= (double)(9 * BIRDNET_SPEC_WIDTH);
-            int b0 = -1, b1 = -1, b2 = -1;
-            float v0 = -1e30f, v1 = -1e30f, v2 = -1e30f;
-            for (int i = 0; i < birdnet_num_labels; ++i) {
-                float v = scores[i];
-                if (v > v0)      { b2 = b1; v2 = v1; b1 = b0; v1 = v0; b0 = i; v0 = v; }
-                else if (v > v1) { b2 = b1; v2 = v1; b1 = i; v1 = v; }
-                else if (v > v2) { b2 = i; v2 = v; }
-            }
-            ESP_LOGI(TAG, "spectro[mean=%.3f lowband=%.3f] top3: %d:%s=%.2f  %d:%s=%.2f  %d:%s=%.2f",
-                     (double)smean, lowband,
-                     b0, birdnet_label_name(b0), (double)v0,
-                     b1, birdnet_label_name(b1), (double)v1,
-                     b2, birdnet_label_name(b2), (double)v2);
+        /* Seasonal occurrence prior: down-weight out-of-season species for the
+         * current week + location, then re-pick the top class into res. Returns
+         * -1 (res untouched) when the time is unknown or the prior is disabled,
+         * so detection is unchanged until the clock is known. */
+#if BIRDNET_USE_PRIOR
+        const int prior_week = birdnet_apply_prior(scores, birdnet_num_labels, &res);
+#else
+        const int prior_week = -1;
+#endif
+        (void)prior_week;
+
+#if BIRDNET_DEBUG_SCORES || BIRDNET_LOG_TO_FILE
+        /* Diagnostic snapshot of this inference: overall spectrogram mean, the
+         * low-band (DC..~420 Hz) mean, and the top-3 scoring classes. Shared by
+         * the serial log (BIRDNET_DEBUG_SCORES) and the SD-card CSV log
+         * (BIRDNET_LOG_TO_FILE). A healthy classifier shows the top class
+         * varying with the audio and a clear margin; a stuck/near-equal top-1
+         * points at preprocessing rather than the audio. */
+        double smean = 0.0;
+        for (int i = 0; i < BIRDNET_MODEL_INPUT_LEN; ++i) {
+            smean += spectro[i];
         }
+        smean /= (double)BIRDNET_MODEL_INPUT_LEN;
+        double lowband = 0.0;
+        for (int b = 0; b < 9; ++b) {
+            for (int t = 0; t < BIRDNET_SPEC_WIDTH; ++t) {
+                lowband += spectro[b * BIRDNET_SPEC_WIDTH + t];
+            }
+        }
+        lowband /= (double)(9 * BIRDNET_SPEC_WIDTH);
+        int b0 = -1, b1 = -1, b2 = -1;
+        float v0 = -1e30f, v1 = -1e30f, v2 = -1e30f;
+        for (int i = 0; i < birdnet_num_labels; ++i) {
+            float v = scores[i];
+            if (v > v0)      { b2 = b1; v2 = v1; b1 = b0; v1 = v0; b0 = i; v0 = v; }
+            else if (v > v1) { b2 = b1; v2 = v1; b1 = i; v1 = v; }
+            else if (v > v2) { b2 = i; v2 = v; }
+        }
+#endif
+#if BIRDNET_DEBUG_SCORES
+        ESP_LOGI(TAG, "spectro[mean=%.3f lowband=%.3f] top3: %d:%s=%.2f  %d:%s=%.2f  %d:%s=%.2f  infer=%.0fms  wk=%d adj=%s=%.2f",
+                 (double)smean, lowband,
+                 b0, birdnet_label_name(b0), (double)v0,
+                 b1, birdnet_label_name(b1), (double)v1,
+                 b2, birdnet_label_name(b2), (double)v2,
+                 (double)infer_ms,
+                 prior_week,
+                 (res.top_index >= 0) ? birdnet_label_name(res.top_index) : "?",
+                 (double)res.top_score);
 #endif
 
         /* Per-frame candidate: the top class, but only when it clears the score
@@ -278,6 +470,26 @@ static void infer_task(void *arg)
                      (double)(res.top_score * 100.0f),
                      vote_count, BIRDNET_DETECT_CONSECUTIVE);
         }
+#endif
+
+#if BIRDNET_LOG_TO_FILE
+        int clip_id = -1;
+#if BIRDNET_LOG_AUDIO
+        /* Save the exact 3 s chunk this inference scored, named to match the
+         * CSV row's "clip" column. v0 is the top-1 score (0 floor = save all). */
+        if (v0 >= BIRDNET_LOG_AUDIO_MIN_SCORE) {
+            char wp[64];
+            snprintf(wp, sizeof(wp), "%s/clip%06u.wav",
+                     BIRDNET_LOG_AUDIO_DIR, (unsigned)clip_seq);
+            if (birdlog_wav_clip(wp, chunk, BIRDNET_CHUNK_SAMPLES) == ESP_OK) {
+                clip_id = (int)clip_seq;
+                ++clip_seq;
+            }
+        }
+#endif
+        birdlog_row(chunk_db, smean, lowband, prior_week, b0, v0, b1, v1, b2, v2,
+                    res.top_index, res.top_score, frame_hit ? 1 : 0, vote_count,
+                    detected ? 1 : 0, infer_ms, clip_id);
 #endif
 
         /* Detections go to the serial log AND drive the on-screen overlay. */
@@ -341,30 +553,6 @@ static void demo_task(void *arg)
  * added to the training "background" class and the model is fine-tuned, so it
  * stops defaulting to a bird on the device's own noise floor. The mic + model
  * are otherwise idle. Enabled by BIRDNET_RECORD_MODE (see birdnet_config.h). */
-
-/* Write a 44-byte canonical PCM WAV header for a known sample count. ESP32-S3 is
- * little-endian and WAV is little-endian, so the integer fields copy directly. */
-static void wav_write_header(FILE *f, uint32_t num_samples)
-{
-    const uint32_t sr         = BIRDNET_SAMPLE_RATE_HZ;
-    const uint16_t ch         = 1;
-    const uint16_t bits       = 16;
-    const uint16_t block_algn = (uint16_t)(ch * (bits / 8));
-    const uint32_t byte_rate  = sr * block_algn;
-    const uint32_t data_bytes = num_samples * block_algn;
-    const uint32_t riff_size  = 36 + data_bytes;
-    const uint32_t fmt_size   = 16;
-    const uint16_t fmt_pcm    = 1;
-    uint8_t h[44];
-    memcpy(h + 0,  "RIFF", 4);   memcpy(h + 4,  &riff_size, 4);
-    memcpy(h + 8,  "WAVE", 4);
-    memcpy(h + 12, "fmt ", 4);   memcpy(h + 16, &fmt_size, 4);
-    memcpy(h + 20, &fmt_pcm, 2); memcpy(h + 22, &ch, 2);
-    memcpy(h + 24, &sr, 4);      memcpy(h + 28, &byte_rate, 4);
-    memcpy(h + 32, &block_algn, 2); memcpy(h + 34, &bits, 2);
-    memcpy(h + 36, "data", 4);   memcpy(h + 40, &data_bytes, 4);
-    fwrite(h, 1, sizeof(h), f);
-}
 
 static void record_task(void *arg)
 {
@@ -473,6 +661,17 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-S3-EYE BirdNET starting (stm32 DS-CNN, SD multi-model)");
 
+#if BIRDNET_USE_PRIOR
+    /* NVS backs the WiFi calibration store and persists the last known date for
+     * the seasonal prior across reboots. Erase + retry on a layout change. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+#endif
+
     s_ring_mutex  = xSemaphoreCreateMutex();
     s_infer_sem   = xSemaphoreCreateBinary();
     s_ring = (int16_t *)heap_caps_calloc(BIRDNET_CHUNK_SAMPLES, sizeof(int16_t),
@@ -529,6 +728,13 @@ void app_main(void)
 #else
     /* Audio last, so the first inference has a model + valid chunk forming. */
     ESP_ERROR_CHECK(audio_capture_init());
+
+#if BIRDNET_USE_PRIOR
+    /* Kick off WiFi + SNTP time sync in the background. Detection runs right
+     * away regardless; the seasonal prior simply switches on once the week is
+     * known (and stays off if no WiFi is configured). */
+    birdnet_time_start();
+#endif
 
     /* Core split: audio capture (prio 6) + inference (prio 5) on core 1; the UI
      * render loop (this task) + LVGL flush run on core 0. Audio outranks infer

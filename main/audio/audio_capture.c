@@ -24,12 +24,22 @@ static const char *TAG = "audio_capture";
 
 static esp_codec_dev_handle_t s_mic = NULL;
 
-/* Software input gain (linear). 1.0 = unity. The S3-EYE's I2S MEMS mic has no
- * hardware/codec gain stage, so esp_codec_dev_set_in_gain() returns
- * NOT_SUPPORTED and the configured BIRDNET_MIC_GAIN_DB would otherwise do
- * nothing -- leaving the raw MEMS level too quiet for moderate sources. When
- * hardware gain is unavailable we set this from BIRDNET_MIC_GAIN_DB and apply
- * it digitally in the decimation loop (with the existing saturation clamp). */
+/* Software input gain (linear). 1.0 = unity (the default; BIRDNET_MIC_GAIN_DB = 0).
+ *
+ * We deliberately do NOT boost the audio in software by default. The S3-EYE's
+ * I2S MEMS mic has no hardware/codec gain stage (esp_codec_dev_set_in_gain()
+ * returns NOT_SUPPORTED), and a *digital* gain applied after the ADC scales the
+ * signal and the mic's self-noise together -- it cannot improve SNR, only add a
+ * clipping/saturation risk on loud sources. The classifier also min-max
+ * normalizes every spectrogram, so the absolute level is divided back out and
+ * the model is indifferent to it. Instead of gaining up, the level gate and the
+ * on-screen meter (BIRDNET_LEVEL_DB_* in birdnet_config.h) are calibrated to the
+ * mic's native level, so the model is fed the cleanest (raw) samples.
+ *
+ * Only a real *hardware* gain stage (set via BIRDNET_MIC_GAIN_DB on a device
+ * that has one) sits ahead of the ADC and genuinely improves SNR; the software
+ * path below stays as a fallback for anyone who explicitly sets a non-zero
+ * BIRDNET_MIC_GAIN_DB and accepts the trade-off. */
 static float s_gain_lin = 1.0f;
 
 /*
@@ -93,12 +103,14 @@ esp_err_t audio_capture_init(void)
         return ESP_FAIL;
     }
 
-    /* Apply input gain. Prefer the codec's hardware gain; if the device has no
-     * gain stage (the S3-EYE MEMS mic returns NOT_SUPPORTED), fall back to
-     * applying the same gain digitally in the read path so BIRDNET_MIC_GAIN_DB
-     * still takes effect. */
+    /* Input gain. Prefer a real hardware (pre-ADC) gain -- the only kind that
+     * improves SNR. The S3-EYE MEMS mic has no gain stage (returns
+     * NOT_SUPPORTED); rather than emulate it in software (which can't improve
+     * SNR and only risks clipping), the default BIRDNET_MIC_GAIN_DB is 0, so we
+     * feed the raw level and let the gate + meter handle the native scale. A
+     * non-zero gain still falls back to software for anyone who wants it. */
     int rc = esp_codec_dev_set_in_gain(s_mic, BIRDNET_MIC_GAIN_DB);
-    if (rc != ESP_CODEC_DEV_OK) {
+    if (rc != ESP_CODEC_DEV_OK && BIRDNET_MIC_GAIN_DB != 0.0f) {
         s_gain_lin = powf(10.0f, BIRDNET_MIC_GAIN_DB / 20.0f);
         ESP_LOGW(TAG, "HW mic gain unsupported (rc=%d); applying %.0f dB (%.1fx) in software",
                  rc, (double)BIRDNET_MIC_GAIN_DB, (double)s_gain_lin);

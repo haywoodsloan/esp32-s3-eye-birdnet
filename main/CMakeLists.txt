@@ -11,6 +11,7 @@ idf_component_register(
         "model/model_data.cc"
         "model/labels.c"
         "model/model_registry.c"
+        "net/birdnet_time.c"
         "ui/ui.c"
         "ui/assets/roboto_28.c"
         "ui/assets/roboto_18.c"
@@ -21,6 +22,7 @@ idf_component_register(
         "audio"
         "dsp"
         "model"
+        "net"
         "ui"
 )
 

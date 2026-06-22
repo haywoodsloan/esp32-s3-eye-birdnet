@@ -1,0 +1,19 @@
+menu "BirdNET detector"
+
+config BIRDNET_WIFI_SSID
+    string "WiFi SSID (for NTP time sync)"
+    default ""
+    help
+        Name of the WiFi network the device joins to fetch the current date/time
+        over SNTP. The time drives the seasonal occurrence prior (which birds are
+        likely during the current week at the configured location). Leave blank
+        to skip WiFi entirely; the seasonal prior then stays disabled.
+
+config BIRDNET_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+    help
+        Password for BIRDNET_WIFI_SSID. This is saved only in sdkconfig, which is
+        gitignored in this project, so it is never committed.
+
+endmenu
