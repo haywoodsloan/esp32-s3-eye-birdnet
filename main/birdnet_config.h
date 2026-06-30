@@ -129,10 +129,15 @@
 #ifndef BIRDNET_USE_PRIOR
 #define BIRDNET_USE_PRIOR           1
 #endif
-/* Overall effect [0..1]: 0 = no change (weight 1 everywhere), 1 = full prior. */
-#define BIRDNET_PRIOR_STRENGTH      0.5f
+/* Overall effect [0..1]: 0 = no change (weight 1 everywhere), 1 = full prior.
+ * Set to 1.0 after the 2026-06 field test: run10 collapses onto out-of-season
+ * winter species (Red-breasted Nuthatch) on outdoor noise, and 0.5 left the
+ * strong (~0.9) false hits above threshold (0.94*0.63 = 0.59 still fires). At
+ * 1.0 they drop to ~0.14. Dial back toward 0.5 if a genuinely-present species
+ * the meta-model under-rates ever gets suppressed. */
+#define BIRDNET_PRIOR_STRENGTH      1.0f
 /* Lowest weight a fully out-of-season species can receive at STRENGTH=1 [0..1]. */
-#define BIRDNET_PRIOR_FLOOR         0.25f
+#define BIRDNET_PRIOR_FLOOR         0.15f
 /* Re-sync the clock over SNTP this often (hours); the prior only needs the week. */
 #define BIRDNET_TIME_RESYNC_HOURS   12
 
