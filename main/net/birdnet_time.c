@@ -93,6 +93,11 @@ static void restore_epoch(void)
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)data;
+    /* May already be torn down: a queued event can reach us after a failed connect. */
+    EventGroupHandle_t events = s_wifi_events;
+    if (events == NULL) {
+        return;
+    }
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -100,11 +105,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             esp_wifi_connect();
             ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", ++s_retry, WIFI_MAX_RETRY);
         } else {
-            xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
+            xEventGroupSetBits(events, WIFI_FAIL_BIT);
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_retry = 0;
-        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(events, WIFI_CONNECTED_BIT);
     }
 }
 
@@ -193,6 +198,9 @@ static esp_err_t wifi_connect(void)
     err = ESP_FAIL;
 
 deinit:
+    /* Before the event group goes away, so a queued event cannot reference it. */
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi_event);
     esp_wifi_deinit();
 cleanup:
     vEventGroupDelete(s_wifi_events);
