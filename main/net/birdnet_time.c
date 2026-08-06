@@ -108,27 +108,59 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
+/*
+ * Bring up WiFi STA and wait for an IP. Every step returns its error instead of
+ * ESP_ERROR_CHECK-aborting: the seasonal prior is a best-effort enhancement, so
+ * a failure here (most commonly low internal RAM for the WiFi static RX buffers)
+ * must NOT crash the device -- the caller falls back to stored/unknown time and
+ * the detector keeps running on the model alone. On any failure the partially
+ * initialised WiFi is torn back down so it does not hold internal RAM.
+ */
 static esp_err_t wifi_connect(void)
 {
+    esp_err_t err;
+    EventBits_t bits;
+
     s_wifi_events = xEventGroupCreate();
     if (s_wifi_events == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    esp_err_t loop_err = esp_event_loop_create_default();
-    if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
-        ESP_ERROR_CHECK(loop_err);
+    err = esp_netif_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+        goto cleanup;
     }
+
+    err = esp_event_loop_create_default();
+    if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK;   /* a default event loop already exists -- fine */
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "event loop create failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    err = esp_wifi_init(&init_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_init failed: %s (low internal RAM?) -- "
+                      "continuing without time sync", esp_err_to_name(err));
+        goto cleanup;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi_event, NULL, NULL));
+    err = esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL, NULL);
+    if (err == ESP_OK) {
+        err = esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi_event, NULL, NULL);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "event handler register failed: %s", esp_err_to_name(err));
+        goto deinit;
+    }
 
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid, CONFIG_BIRDNET_WIFI_SSID, sizeof(wc.sta.ssid));
@@ -136,16 +168,36 @@ static esp_err_t wifi_connect(void)
     wc.sta.pmf_cfg.capable  = true;   /* allow, but don't require, WPA3/PMF */
     wc.sta.pmf_cfg.required = false;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi start failed: %s", esp_err_to_name(err));
+        goto deinit;
+    }
 
     ESP_LOGI(TAG, "connecting to WiFi \"%s\"...", CONFIG_BIRDNET_WIFI_SSID);
-    EventBits_t bits = xEventGroupWaitBits(
+    bits = xEventGroupWaitBits(
         s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+    if (bits & WIFI_CONNECTED_BIT) {
+        return ESP_OK;   /* leave WiFi + event group up for the SNTP exchange */
+    }
 
-    return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_FAIL;
+    ESP_LOGW(TAG, "WiFi did not connect within timeout");
+    esp_wifi_stop();
+    err = ESP_FAIL;
+
+deinit:
+    esp_wifi_deinit();
+cleanup:
+    vEventGroupDelete(s_wifi_events);
+    s_wifi_events = NULL;
+    return (err == ESP_OK) ? ESP_FAIL : err;
 }
 
 /* ---- SNTP --------------------------------------------------------------- */
