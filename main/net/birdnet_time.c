@@ -116,17 +116,22 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 /*
  * Bring up WiFi STA and wait for an IP. Every step returns its error instead of
  * ESP_ERROR_CHECK-aborting: the seasonal prior is a best-effort enhancement, so
- * a failure here (most commonly low internal RAM for the WiFi static RX buffers)
- * must NOT crash the device -- the caller falls back to stored/unknown time and
- * the detector keeps running on the model alone. On any failure the partially
- * initialised WiFi is torn back down so it does not hold internal RAM.
+ * a failure here (low internal RAM, or simply out of range of the AP) must NOT
+ * crash the device -- the caller falls back to stored/unknown time and the
+ * detector keeps running on the model alone. On failure the WiFi stack is torn
+ * back down so it does not hold internal RAM, but the event group is
+ * deliberately kept: an event queued before teardown can still be dispatched
+ * afterwards, and freeing it underneath the handler crash-looped the board in
+ * the field (2026-08 night test, 117 reboots).
  */
 static esp_err_t wifi_connect(void)
 {
     esp_err_t err;
     EventBits_t bits;
 
-    s_wifi_events = xEventGroupCreate();
+    if (s_wifi_events == NULL) {
+        s_wifi_events = xEventGroupCreate();
+    }
     if (s_wifi_events == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -198,13 +203,10 @@ static esp_err_t wifi_connect(void)
     err = ESP_FAIL;
 
 deinit:
-    /* Before the event group goes away, so a queued event cannot reference it. */
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi_event);
     esp_wifi_deinit();
 cleanup:
-    vEventGroupDelete(s_wifi_events);
-    s_wifi_events = NULL;
     return (err == ESP_OK) ? ESP_FAIL : err;
 }
 
