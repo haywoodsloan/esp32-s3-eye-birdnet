@@ -31,6 +31,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 
 #include "bsp/esp32_s3_eye.h"
@@ -295,10 +296,23 @@ static void infer_task(void *arg)
     {
         FILE *lf = fopen(BIRDNET_LOG_PATH, "a");
         if (lf != NULL) {
-            fprintf(lf, "# session start ms=%u\n", (unsigned)esp_log_timestamp());
+            /* Reset reason distinguishes a firmware crash (PANIC/WDT) from a
+             * power problem (BROWNOUT/POWERON) when running untethered. */
+            static const char *const reset_names[] = {
+                "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT", "TASK_WDT",
+                "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO", "USB", "JTAG", "EFUSE",
+                "PWR_GLITCH", "CPU_LOCKUP",
+            };
+            int rr = (int)esp_reset_reason();
+            const char *rname = (rr >= 0 && rr < (int)(sizeof(reset_names) / sizeof(reset_names[0])))
+                                ? reset_names[rr] : "?";
+            fprintf(lf, "# session start ms=%u reset=%s free_int=%u free_psram=%u\n",
+                    (unsigned)esp_log_timestamp(), rname,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             fprintf(lf, "ms,level_db,mean,lowband,week,t1,t1s,t2,t2s,t3,t3s,a1,a1s,hit,vote,det,infer_ms,clip\n");
             fclose(lf);
-            ESP_LOGI(TAG, "diagnostic file logging -> %s", BIRDNET_LOG_PATH);
+            ESP_LOGI(TAG, "diagnostic file logging -> %s (reset=%s)", BIRDNET_LOG_PATH, rname);
         } else {
             ESP_LOGW(TAG, "could not open log file %s (SD mounted?)", BIRDNET_LOG_PATH);
         }
